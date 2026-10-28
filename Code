@@ -1,0 +1,373 @@
+const SPREADSHEET_ID = '1RBFyFqA4qWmCLPFjlTxYFVPZfhiQ0it_RFQHZ_gEZ24';
+const DEFAULT_DRIVE_FOLDER_ID = '1r-lfCN2jz6noCazhbadezLz0GvIcP7ef';
+const TAB_PHOTOS = 'Photos';
+const TAB_PRESETS = 'Presets';
+
+function doGet(e) {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('TrustMark — Live Camera & Photo Stamping')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  try {
+    var body = JSON.parse(e.postData.contents);
+    var action = body.action;
+    var payload = body.payload || {};
+    var result;
+
+    if (action === 'savePhotoRecord') {
+      result = savePhotoRecord(payload);
+    } else if (action === 'getPhotosHistory') {
+      result = getPhotosHistory();
+    } else if (action === 'deletePhotoRecord') {
+      result = deletePhotoRecord(payload);
+    } else if (action === 'verifyPhotoCode') {
+      result = verifyPhotoCode(payload);
+    } else if (action === 'getPresets') {
+      result = getPresets();
+    } else if (action === 'savePreset') {
+      result = savePreset(payload);
+    } else if (action === 'deletePreset') {
+      result = deletePreset(payload);
+    } else {
+      throw new Error('Unknown action: ' + action);
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({ ok: true, data: serializeForClient(result) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({ ok: false, message: String(err && err.message ? err.message : err) }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+/**
+ * Jalankan fungsi ini sekali dari editor Apps Script untuk membuat/memperbarui tabel database.
+ */
+function setupDatabase() {
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  var photosSheet = ss.getSheetByName(TAB_PHOTOS);
+  if (!photosSheet) {
+    photosSheet = ss.insertSheet(TAB_PHOTOS);
+  }
+  var photoHeaders = [
+    'id', 'createdAt', 'fileName', 'driveUrl', 'thumbnail',
+    'lat', 'lng', 'address', 'company', 'note',
+    'deviceModel', 'photoCode', 'stateJson'
+  ];
+  photosSheet.getRange(1, 1, 1, photoHeaders.length).setValues([photoHeaders]);
+
+  var presetsSheet = ss.getSheetByName(TAB_PRESETS);
+  if (!presetsSheet) {
+    presetsSheet = ss.insertSheet(TAB_PRESETS);
+  }
+  var presetHeaders = ['id', 'type', 'name', 'dataJson', 'updatedAt'];
+  presetsSheet.getRange(1, 1, 1, presetHeaders.length).setValues([presetHeaders]);
+
+  return { initialized: true };
+}
+
+function ensureSheetWithHeaders(tabName, headers) {
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet) {
+    sheet = ss.insertSheet(tabName);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+  return sheet;
+}
+
+function serializeForClient(value) {
+  if (value === null || value === undefined) return null;
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return value.toISOString();
+  }
+  if (Array.isArray(value)) {
+    var arr = [];
+    for (var i = 0; i < value.length; i++) {
+      arr.push(serializeForClient(value[i]));
+    }
+    return arr;
+  }
+  if (typeof value === 'object') {
+    var obj = {};
+    for (var k in value) {
+      if (Object.prototype.hasOwnProperty.call(value, k)) {
+        obj[k] = serializeForClient(value[k]);
+      }
+    }
+    return obj;
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value;
+  }
+  return String(value);
+}
+
+function extractDriveFolderId(input) {
+  var raw = String(input || '').trim();
+  if (!raw) return DEFAULT_DRIVE_FOLDER_ID;
+  var match = raw.match(/\/folders\/([a-zA-Z0-9_-]{10,})/);
+  if (match && match[1]) return match[1];
+  var idParam = raw.match(/[?&]id=([a-zA-Z0-9_-]{10,})/);
+  if (idParam && idParam[1]) return idParam[1];
+  if (/^[a-zA-Z0-9_-]{15,}$/.test(raw)) return raw;
+  return DEFAULT_DRIVE_FOLDER_ID;
+}
+
+function getOrCreateSubFolder(parentFolder, folderName) {
+  var cleanName = String(folderName || '').replace(/[\\/:*?"<>|]/g, '-').trim() || 'Umum';
+  var iter = parentFolder.getFoldersByName(cleanName);
+  if (iter.hasNext()) {
+    return iter.next();
+  }
+  return parentFolder.createFolder(cleanName);
+}
+
+function savePhotoRecord(payload) {
+  var headers = [
+    'id', 'createdAt', 'fileName', 'driveUrl', 'thumbnail',
+    'lat', 'lng', 'address', 'company', 'note',
+    'deviceModel', 'photoCode', 'stateJson'
+  ];
+  var sheet = ensureSheetWithHeaders(TAB_PHOTOS, headers);
+  var id = 'TM-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
+  var nowIso = new Date().toISOString();
+  var fileName = String(payload.fileName || ('TrustMark_' + id + '.jpg'));
+  var driveUrl = '';
+  var folderPath = '';
+
+  // ponytail: simpan ke Folder Drive Default -> Subfolder Tanggal -> Subfolder User; fallback ke root jika folder ID belum diakses
+  if (payload.base64Jpeg && payload.base64Jpeg.indexOf('base64,') !== -1) {
+    try {
+      var base64Data = payload.base64Jpeg.split('base64,')[1];
+      var decoded = Utilities.base64Decode(base64Data);
+      var blob = Utilities.newBlob(decoded, 'image/jpeg', fileName);
+      var targetFolderId = extractDriveFolderId(payload.driveFolderInput);
+      var rootFolder;
+      try {
+        rootFolder = DriveApp.getFolderById(targetFolderId);
+      } catch (folderErr) {
+        rootFolder = DriveApp.getRootFolder();
+      }
+      var dateFolderStr = String(payload.captureDate || nowIso.slice(0, 10)).trim();
+      var targetFolder = getOrCreateSubFolder(rootFolder, dateFolderStr);
+      folderPath = dateFolderStr;
+
+      var userFolderStr = String(payload.userName || payload.company || '').trim();
+      if (userFolderStr) {
+        targetFolder = getOrCreateSubFolder(targetFolder, userFolderStr);
+        folderPath = dateFolderStr + '/' + userFolderStr;
+      }
+
+      var driveFile = targetFolder.createFile(blob);
+      driveUrl = driveFile.getUrl();
+    } catch (driveErr) {
+      driveUrl = '';
+    }
+  }
+
+  var row = [
+    id,
+    nowIso,
+    fileName,
+    driveUrl,
+    String(payload.thumbnail || '').slice(0, 48000),
+    Number(payload.lat || 0),
+    Number(payload.lng || 0),
+    String(payload.address || ''),
+    String(payload.company || ''),
+    String(payload.note || ''),
+    String(payload.deviceModel || ''),
+    String(payload.photoCode || ''),
+    String(payload.stateJson || '').slice(0, 48000)
+  ];
+
+  sheet.appendRow(row);
+  return { id: id, createdAt: nowIso, driveUrl: driveUrl, folderPath: folderPath };
+}
+
+function getPhotosHistory() {
+  var headers = [
+    'id', 'createdAt', 'fileName', 'driveUrl', 'thumbnail',
+    'lat', 'lng', 'address', 'company', 'note',
+    'deviceModel', 'photoCode', 'stateJson'
+  ];
+  var sheet = ensureSheetWithHeaders(TAB_PHOTOS, headers);
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+
+  var data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  var out = [];
+  for (var i = data.length - 1; i >= 0 && out.length < 40; i--) {
+    var r = data[i];
+    if (!r[0]) continue;
+    out.push({
+      id: String(r[0]),
+      createdAt: r[1] instanceof Date ? r[1].toISOString() : String(r[1] || ''),
+      fileName: String(r[2] || ''),
+      driveUrl: String(r[3] || ''),
+      thumbnail: String(r[4] || ''),
+      lat: Number(r[5] || 0),
+      lng: Number(r[6] || 0),
+      address: String(r[7] || ''),
+      company: String(r[8] || ''),
+      note: String(r[9] || ''),
+      deviceModel: String(r[10] || ''),
+      photoCode: String(r[11] || ''),
+      stateJson: String(r[12] || '')
+    });
+  }
+  return out;
+}
+
+function deletePhotoRecord(payload) {
+  var targetId = String(payload.id || '');
+  if (!targetId) throw new Error('ID foto wajib diisi');
+  var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(TAB_PHOTOS);
+  if (!sheet || sheet.getLastRow() <= 1) return { deleted: false };
+
+  var ids = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues();
+  for (var i = ids.length - 1; i >= 0; i--) {
+    if (String(ids[i][0]) === targetId) {
+      sheet.deleteRow(i + 2);
+      return { deleted: true };
+    }
+  }
+  return { deleted: false };
+}
+
+function verifyPhotoCode(payload) {
+  var code = String(payload.photoCode || '').trim().toUpperCase();
+  if (!code) return { found: false, record: null };
+  var headers = [
+    'id', 'createdAt', 'fileName', 'driveUrl', 'thumbnail',
+    'lat', 'lng', 'address', 'company', 'note',
+    'deviceModel', 'photoCode', 'stateJson'
+  ];
+  var sheet = ensureSheetWithHeaders(TAB_PHOTOS, headers);
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return { found: false, record: null };
+
+  var data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  for (var i = data.length - 1; i >= 0; i--) {
+    var r = data[i];
+    var rowCode = String(r[11] || '').trim().toUpperCase();
+    if (rowCode === code || (code.length >= 6 && rowCode.indexOf(code) === 0)) {
+      return {
+        found: true,
+        record: {
+          id: String(r[0] || ''),
+          createdAt: r[1] instanceof Date ? r[1].toISOString() : String(r[1] || ''),
+          fileName: String(r[2] || ''),
+          driveUrl: String(r[3] || ''),
+          lat: Number(r[5] || 0),
+          lng: Number(r[6] || 0),
+          address: String(r[7] || ''),
+          company: String(r[8] || ''),
+          note: String(r[9] || ''),
+          deviceModel: String(r[10] || ''),
+          photoCode: rowCode
+        }
+      };
+    }
+  }
+  return { found: false, record: null };
+}
+
+function getPresets() {
+  var headers = ['id', 'type', 'name', 'dataJson', 'updatedAt'];
+  var sheet = ensureSheetWithHeaders(TAB_PRESETS, headers);
+  var lastRow = sheet.getLastRow();
+  var locations = [];
+  var logos = [];
+  if (lastRow <= 1) {
+    return { locations: locations, logos: logos };
+  }
+
+  var maxCol = Math.max(headers.length, sheet.getLastColumn());
+  var data = sheet.getRange(2, 1, lastRow - 1, maxCol).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var r = data[i];
+    if (!r[0]) continue;
+    // ponytail: gabungkan chunk kolom 4 + kolom 6..maxCol agar file font .ttf/.otf >48KB utuh tanpa tabel tambahan
+    var fullJson = String(r[3] || '');
+    for (var c = 5; c < r.length; c++) {
+      if (r[c]) fullJson += String(r[c]);
+    }
+    var item = {
+      id: String(r[0]),
+      type: String(r[1] || 'location'),
+      name: String(r[2] || ''),
+      dataJson: fullJson || '{}',
+      updatedAt: r[4] instanceof Date ? r[4].toISOString() : String(r[4] || '')
+    };
+    if (item.type === 'logo') {
+      logos.push(item);
+    } else {
+      locations.push(item);
+    }
+  }
+  return { locations: locations, logos: logos };
+}
+
+function splitPresetChunks(rawStr) {
+  var str = String(rawStr || '{}');
+  var chunkSize = 45000;
+  var firstChunk = str.slice(0, chunkSize);
+  var overflow = [];
+  for (var pos = chunkSize; pos < str.length && overflow.length < 10; pos += chunkSize) {
+    overflow.push(str.slice(pos, pos + chunkSize));
+  }
+  while (overflow.length < 10) {
+    overflow.push('');
+  }
+  return { first: firstChunk, overflow: overflow };
+}
+
+function savePreset(payload) {
+  var name = String(payload.name || '').trim();
+  var type = String(payload.type || 'location').trim();
+  if (!name) throw new Error('Nama preset tidak boleh kosong');
+
+  var headers = ['id', 'type', 'name', 'dataJson', 'updatedAt'];
+  var sheet = ensureSheetWithHeaders(TAB_PRESETS, headers);
+  var nowIso = new Date().toISOString();
+  var parts = splitPresetChunks(payload.dataJson || '{}');
+
+  // Overwrite existing row if same preset name & type already exists (keeps Master Sync single & clean)
+  var lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    var existing = sheet.getRange(2, 1, lastRow - 1, 3).getValues();
+    for (var i = existing.length - 1; i >= 0; i--) {
+      if (String(existing[i][1]) === type && String(existing[i][2]) === name) {
+        var rowValues = [parts.first, nowIso].concat(parts.overflow);
+        sheet.getRange(i + 2, 4, 1, rowValues.length).setValues([rowValues]);
+        return getPresets();
+      }
+    }
+  }
+
+  var id = 'PR-' + new Date().getTime() + '-' + Math.floor(Math.random() * 1000);
+  var newRow = [id, type, name, parts.first, nowIso].concat(parts.overflow);
+  sheet.appendRow(newRow);
+  return getPresets();
+}
+
+function deletePreset(payload) {
+  var targetId = String(payload.id || '');
+  var sheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName(TAB_PRESETS);
+  if (sheet && sheet.getLastRow() > 1) {
+    var ids = sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues();
+    for (var i = ids.length - 1; i >= 0; i--) {
+      if (String(ids[i][0]) === targetId) {
+        sheet.deleteRow(i + 2);
+        break;
+      }
+    }
+  }
+  return getPresets();
+}
